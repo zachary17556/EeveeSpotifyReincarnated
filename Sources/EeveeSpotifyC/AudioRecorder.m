@@ -1,9 +1,14 @@
-// AudioRecorder.m - captures Spotify's decoded audio by hooking AudioUnitRender.
+// AudioRecorder.m - captures Spotify's decoded audio by hooking AudioUnitRender
+// (audiounit) or by attaching AudioUnitAddRenderNotify (alternate).
 //
 // Why this version exists: the inline hook (MSHookFunction) can only patch code when the process
 // has JIT / a debugger attached. Without it MSHookFunction returned no trampoline and a SECOND call
 // crashed the app. Now: probe first, try at most once per process, leave a crash marker so a crash
 // inside the hook is never repeated, and always explain the failure in the log and in LastError.
+//
+// The alternate method is a JIT-free path: instead of interposing a global symbol, we attach a
+// render-notify callback to the AudioUnit Spotify already uses. Same AudioBufferList, same ring
+// buffer, same writer thread — only the entry point changes.
 
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
@@ -23,10 +28,12 @@
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import "EVRecorderInternal.h"
 
 #if __has_include(<ptrauth.h>)
 #import <ptrauth.h>
+#import "../../modules/fishhook/fishhook.h"
 #endif
 
 #ifndef MAP_JIT
@@ -47,10 +54,12 @@ NSString *const EeveeRecorderDidFinishNotification = @"EeveeRecorderDidFinishNot
 #define BATCH_FRAMES 2048u
 #define WAV_MAX_BYTES 0xFFFFF000ull
 #define MIN_FREE_BYTES (300ull * 1024 * 1024)
+#define MIN_FREE_STOP_BYTES (150ull * 1024 * 1024)   // lower than the start threshold, so a recording cannot start and stop at once
 
 typedef OSStatus (*RenderFunction)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *,
                                    UInt32, UInt32, AudioBufferList *);
 typedef void (*MSHookFunctionType)(void *symbol, void *replace, void **result);
+
 
 #pragma mark - State
 
@@ -63,7 +72,7 @@ static pthread_mutex_t ctlLock = PTHREAD_MUTEX_INITIALIZER;
 
 static float ring[RING_SAMPLES];
 static _Atomic(uint64_t) writeIndex, readIndex;
-static _Atomic(bool) capturing, sessionActive, formatReady, abortFlag;
+static _Atomic(bool) capturing, sessionActive, finalizing, formatReady, abortFlag;
 static _Atomic(uint32_t) sampleRate = 44100, fmtChannels, fmtBits, mismatchRate;
 static _Atomic(bool) fmtIsFloat;
 static _Atomic(uint64_t) framesCaptured, statCalls, statMatched, statCaptured, statDropped, statBadLayout;
@@ -89,6 +98,25 @@ static NSObject *evSync(void) {
 }
 static void setLastError(NSString *s) { @synchronized(evSync()) { lastErrorText = [s copy]; } }
 NSString *EeveeAudioRecorderLastError(void) { @synchronized(evSync()) { return lastErrorText; } }
+
+// ---- Capture method selection ----
+// "audiounit" installs the MSHookFunction-based AudioUnitRender interposer (needs JIT).
+// "alternate" attaches AudioUnitAddRenderNotify to the AudioUnit Spotify already uses
+// (JIT-free). If alternate cannot attach, we record a reason and fall back to audiounit.
+static _Atomic(bool) captureFallbackUsed;
+static NSString *captureFallbackReason;
+
+static NSString *evCaptureSelectedMethod(void) {
+    NSString *s = EVSettingString(@"captureMethod", @"bmtaptap");
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return @"audiounit";
+    if (![s isEqualToString:@"audiounit"]
+        && ![s isEqualToString:@"alternate"]
+        && ![s isEqualToString:@"converter"]
+        && ![s isEqualToString:@"pump"]
+        && ![s isEqualToString:@"bmtaptap"]) return @"audiounit";
+    return s;
+}
+
 static void evPostState(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] postNotificationName:EeveeRecorderStateDidChangeNotification object:nil];
@@ -216,6 +244,11 @@ static void recheckRate(AudioUnit unit) {
     }
 }
 
+// Converter variant: format comes from the AudioConverter, not from an AU.
+
+
+
+
 #pragma mark - Ring buffer (realtime side)
 
 static bool pushSamples(const float *samples, uint32_t count) {
@@ -287,6 +320,65 @@ static void captureBuffers(AudioBufferList *list, UInt32 frames) {
     atomic_fetch_add_explicit(&statCaptured, 1, memory_order_relaxed);
 }
 
+
+// ============================================================
+// LIVE BASS VISUALIZER (FFT)
+// ============================================================
+#include <Accelerate/Accelerate.h>
+
+static _Atomic(float) currentBassLevel = 0.0f;
+float EVGetCurrentBassLevel(void) { return atomic_load_explicit(&currentBassLevel, memory_order_relaxed); }
+
+static FFTSetup fftSetup = NULL;
+static DSPSplitComplex splitComplex;
+static float *fftWindow = NULL;
+static vDSP_Length fftLog2n = 10; // 1024 samples
+static vDSP_Length fftN = 1024;
+
+static void initFFT() {
+    if (fftSetup) return;
+    fftSetup = vDSP_create_fftsetup(fftLog2n, kFFTRadix2);
+    splitComplex.realp = malloc(fftN / 2 * sizeof(float));
+    splitComplex.imagp = malloc(fftN / 2 * sizeof(float));
+    fftWindow = malloc(fftN * sizeof(float));
+    vDSP_hann_window(fftWindow, fftN, vDSP_HANN_NORM);
+}
+
+static void updateBassLevel(const float *samples, uint32_t frames) {
+    if (frames < 1024) return; // Need enough samples for 1024-point FFT
+    initFFT();
+
+    // Copy, window, and interleave to mono for FFT
+    float mono[1024];
+    vDSP_vadd(samples, 2, samples + 1, 2, mono, 1, fftN); // L + R
+    vDSP_vmul(mono, 1, fftWindow, 1, mono, 1, fftN);
+
+    // Pack real signal into split complex
+    vDSP_ctoz((DSPComplex *)mono, 2, &splitComplex, 1, fftN / 2);
+
+    // Perform FFT
+    vDSP_fft_zrip(fftSetup, &splitComplex, 1, fftLog2n, FFT_FORWARD);
+
+    // Calculate magnitudes
+    float magnitudes[512];
+    vDSP_zvabs(&splitComplex, 1, magnitudes, 1, fftN / 2);
+
+    // Sum the first few bins (bass frequencies)
+    float bassSum = 0;
+    for (int i = 1; i < 5; i++) {
+        bassSum += magnitudes[i];
+    }
+
+    // Normalize and smooth
+    float newLevel = bassSum / 50.0f;
+    if (newLevel > 1.0f) newLevel = 1.0f;
+
+    float oldLevel = atomic_load_explicit(&currentBassLevel, memory_order_relaxed);
+    float smoothed = (oldLevel * 0.8f) + (newLevel * 0.2f);
+    atomic_store_explicit(&currentBassLevel, smoothed, memory_order_relaxed);
+}
+// ============================================================
+
 static OSStatus hookedRender(AudioUnit unit, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *time,
                              UInt32 bus, UInt32 frames, AudioBufferList *data) {
     uintptr_t caller = stripPAC(__builtin_return_address(0));
@@ -307,6 +399,7 @@ static OSStatus hookedRender(AudioUnit unit, AudioUnitRenderActionFlags *flags, 
     }
     return status;
 }
+
 
 #pragma mark - Environment / hook installation
 
@@ -333,6 +426,226 @@ static BOOL failHook(NSString *msg) {
     setLastError(msg);
     EVE("Hook", @"FAILED: %@", msg);
     return NO;
+}
+
+
+// ============================================================================
+// Pump hook + fishhook converter fallback (patched)
+// ============================================================================
+#define EV_PUMP_FILE_OFFSET 0x10326a6a8u
+#define EV_PUMP_PROLOGUE    0xD10203FFu
+
+struct EVPumpResult { uint64_t lo, hi; };
+typedef struct EVPumpResult (*EVPumpFn)(void *, void *, size_t *, void *, void *, int);
+static EVPumpFn origPump;
+
+static struct EVPumpResult hookPump(void *provider, void *outBuf, size_t *outBytes,
+                                     void *ioData, void *param5, int flags) {
+    struct EVPumpResult r = origPump(provider, outBuf, outBytes, ioData, param5, flags);
+    if (!EeveeAudioRecorderIsRecording() || !outBuf || !outBytes || *outBytes == 0) return r;
+    size_t bytes = *outBytes;
+    if ((bytes & 3u) != 0) return r;
+    uint32_t floats = (uint32_t)(bytes >> 2);
+    if ((floats & 1u) != 0) floats &= ~1u;
+    if (floats > RING_SAMPLES / 2) floats = RING_SAMPLES / 2;
+    if (floats) pushSamples((const float *)outBuf, floats);
+    return r;
+}
+
+static uintptr_t evSpotifySlide(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        size_t nlen = strlen(name);
+        if ((nlen >= 8 && strcmp(name + nlen - 8, "/Spotify") == 0) ||
+            (nlen >= 15 && strcmp(name + nlen - 15, "/Spotify.dylib") == 0)) {
+            return _dyld_get_image_vmaddr_slide(i);
+        }
+    }
+    return 0;
+}
+
+static BOOL installPumpHook(void) {
+    uintptr_t slide = evSpotifySlide();
+    if (!slide) {
+        EVW("Pump", @"could not locate Spotify image");
+        return NO;
+    }
+    void *target = (void *)(slide + EV_PUMP_FILE_OFFSET);
+    uint32_t prologue = *(volatile uint32_t *)target;
+    if (prologue != EV_PUMP_PROLOGUE) {
+        EVW("Pump", @"unexpected prologue @ %p: 0x%08x (want 0x%08x) - skip",
+            target, prologue, EV_PUMP_PROLOGUE);
+        return NO;
+    }
+    typedef int (*inline_hook_t)(void *, void *, void **);
+    inline_hook_t ink = (inline_hook_t)dlsym(RTLD_DEFAULT, "inline_hook");
+    if (ink) {
+        void *orig = NULL;
+        if (ink(target, (void *)hookPump, &orig) == 0 && orig) {
+            origPump = (EVPumpFn)orig;
+            hookMode = @"pump(inline_hook)";
+            EVI("Pump", @"installed inline_hook @ %p -> orig %p", target, orig);
+            return YES;
+        }
+        EVW("Pump", @"inline_hook failed for %p", target);
+    }
+    MSHookFunctionType ms = (MSHookFunctionType)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (ms) {
+        void *orig = NULL;
+        ms(target, (void *)hookPump, &orig);
+        if (orig) {
+            origPump = (EVPumpFn)orig;
+            hookMode = @"pump(MSHookFunction)";
+            EVI("Pump", @"installed MSHookFunction @ %p -> orig %p", target, orig);
+            return YES;
+        }
+        EVW("Pump", @"MSHookFunction returned no trampoline for %p", target);
+    }
+    return NO;
+}
+
+static OSStatus (*origFillComplex)(
+    AudioConverterRef, UInt32 *, AudioConverterComplexInputDataProc,
+    void *, AudioBufferList *, AudioStreamPacketDescription *);
+
+static OSStatus hookFillComplex(
+    AudioConverterRef conv, UInt32 *ioPackets,
+    AudioConverterComplexInputDataProc proc, void *ud,
+    AudioBufferList *ioData, AudioStreamPacketDescription *outPackDesc)
+{
+    OSStatus st = origFillComplex(conv, ioPackets, proc, ud, ioData, outPackDesc);
+    if (st != noErr || !EeveeAudioRecorderIsRecording() || !ioData || !ioPackets) return st;
+    if (*ioPackets == 0) return st;
+
+    if (ioData->mNumberBuffers == 1
+        && ioData->mBuffers[0].mNumberChannels == 2
+        && ioData->mBuffers[0].mData) {
+        AudioBuffer *b = &ioData->mBuffers[0];
+        uint32_t frames = *ioPackets;
+        uint64_t floats = (uint64_t)frames * 2u;
+        uint64_t maxFloats = (uint64_t)(b->mDataByteSize / sizeof(float));
+        if (floats > maxFloats) floats = maxFloats;
+        floats &= ~1ull;
+        if (floats > RING_SAMPLES / 2) floats = RING_SAMPLES / 2;
+        if (floats) pushSamples((const float *)b->mData, (uint32_t)floats);
+    } else if (ioData->mNumberBuffers >= 2
+               && ioData->mBuffers[0].mNumberChannels == 1
+               && ioData->mBuffers[1].mNumberChannels == 1
+               && ioData->mBuffers[0].mData
+               && ioData->mBuffers[1].mData) {
+        AudioBuffer *L = &ioData->mBuffers[0];
+        AudioBuffer *R = &ioData->mBuffers[1];
+        uint32_t nFrames = *ioPackets;
+        uint32_t availL  = L->mDataByteSize / sizeof(float);
+        uint32_t availR  = R->mDataByteSize / sizeof(float);
+        if (nFrames > availL) nFrames = availL;
+        if (nFrames > availR) nFrames = availR;
+        if (nFrames > RING_SAMPLES / 4) nFrames = RING_SAMPLES / 4;
+        float temp[2048 * 2];
+        const float *l = L->mData, *r = R->mData;
+        while (nFrames) {
+            uint32_t batch = nFrames > 2048 ? 2048 : nFrames;
+            for (uint32_t i = 0; i < batch; i++) {
+                temp[i * 2]     = l[i];
+                temp[i * 2 + 1] = r[i];
+            }
+            pushSamples(temp, batch * 2);
+            l += batch; r += batch; nFrames -= batch;
+        }
+    }
+    return st;
+}
+
+// ---------------------------------------------------------------------------
+// BM tap hook: swizzle BMSampleBufferAudioTap::processAudioBufferList:sampleRate:
+// Spotify's own audio sink. Fires with the exact AudioBufferList that is
+// about to be fed to the visualizer / watch-feed pipeline. No JIT needed:
+// class_replaceMethod works in any process.
+// ---------------------------------------------------------------------------
+typedef void (*BMTapProcessFn)(id, SEL, AudioBufferList *, double);
+static BMTapProcessFn origBMTapProcess;
+static BOOL bmTapInstalled;
+
+static void hookBMTapProcess(id self, SEL _cmd, AudioBufferList *abl, double sr) {
+    if (origBMTapProcess) origBMTapProcess(self, _cmd, abl, sr);
+    if (!atomic_load_explicit(&capturing, memory_order_relaxed)) return;
+    if (!abl || abl->mNumberBuffers == 0) return;
+
+    if (!atomic_load_explicit(&formatReady, memory_order_acquire)) {
+        bool ok = false;
+        if (abl->mNumberBuffers == 1 && abl->mBuffers[0].mNumberChannels == 2 && abl->mBuffers[0].mData)
+            ok = true;
+        else if (abl->mNumberBuffers >= 2
+                 && abl->mBuffers[0].mNumberChannels == 1
+                 && abl->mBuffers[1].mNumberChannels == 1
+                 && abl->mBuffers[0].mData && abl->mBuffers[1].mData)
+            ok = true;
+        if (ok) {
+            atomic_store(&fmtChannels, 2);
+            atomic_store(&fmtBits, 32);
+            atomic_store(&fmtIsFloat, true);
+            atomic_store(&sampleRate, (uint32_t)sr);
+            atomic_store_explicit(&formatReady, true, memory_order_release);
+            EVI("BMtap", @"format locked: rate=%.0f bufs=%u ch=%u", sr,
+                abl->mNumberBuffers, abl->mBuffers[0].mNumberChannels);
+        }
+    }
+    if (!atomic_load_explicit(&formatReady, memory_order_acquire)) return;
+
+    uint32_t bytesPer = 4, frames = 0;
+    if (abl->mNumberBuffers == 1 && abl->mBuffers[0].mNumberChannels == 2) {
+        frames = (uint32_t)(abl->mBuffers[0].mDataByteSize / (bytesPer * 2));
+    } else if (abl->mNumberBuffers >= 2) {
+        uint32_t aL = (uint32_t)(abl->mBuffers[0].mDataByteSize / bytesPer);
+        uint32_t aR = (uint32_t)(abl->mBuffers[1].mDataByteSize / bytesPer);
+        frames = aL < aR ? aL : aR;
+    }
+    if (frames == 0) return;
+
+    uint64_t n = atomic_fetch_add_explicit(&statCalls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&statMatched, 1, memory_order_relaxed);
+    if ((n & 511) == 511) {
+        uint32_t r = (uint32_t)sr;
+        if (r && r != atomic_load_explicit(&sampleRate, memory_order_relaxed)) {
+            atomic_store(&mismatchRate, r);
+            atomic_store(&abortFlag, true);
+        }
+    }
+    captureBuffers(abl, frames);
+}
+
+static BOOL installBMTapHook(void) {
+    if (bmTapInstalled) return YES;
+    Class cls = NSClassFromString(@"BMSampleBufferAudioTap");
+    if (!cls) return failHook(@"BMSampleBufferAudioTap class not found.");
+    SEL sel = NSSelectorFromString(@"processAudioBufferList:sampleRate:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return failHook(@"BMSampleBufferAudioTap has no processAudioBufferList:sampleRate:.");
+    origBMTapProcess = (BMTapProcessFn)method_getImplementation(m);
+    class_replaceMethod(cls, sel, (IMP)hookBMTapProcess, method_getTypeEncoding(m));
+    bmTapInstalled = YES;
+    hookMode = @"bmtaptap";
+    EVI("Hook", @"swizzled BMSampleBufferAudioTap::processAudioBufferList:sampleRate: (orig=%p)",
+        (void *)origBMTapProcess);
+    return YES;
+}
+
+static BOOL installConverterHookOnce(void) {
+    if (origFillComplex) return YES;
+    struct rebinding b = {
+        "AudioConverterFillComplexBuffer",
+        (void *)hookFillComplex,
+        (void **)&origFillComplex
+    };
+    int r = rebind_symbols(&b, 1);
+    if (r != 0 || !origFillComplex) {
+        return failHook(@"fishhook on AudioConverterFillComplexBuffer failed");
+    }
+    hookMode = @"converter(fishhook)";
+    EVI("Hook", @"installed via fishhook (converter/pre-EQ)");
+    return YES;
 }
 
 static BOOL installHookOnce(void) {
@@ -400,6 +713,129 @@ static void evLogEnvironment(void) {
     EVI("Env", @"audio session: category=%@ mode=%@ sampleRate=%.0f outputs=%@", s.category, s.mode, s.sampleRate, outs);
 }
 
+#pragma mark - Alternate capture (render-notify)
+
+// The alternate is a JIT-free entry point into the same audio pipeline:
+// AudioUnitAddRenderNotify fires *after* the AU renders, handing us the exact
+// AudioBufferList that hookedRender used to see, without patching any code.
+
+static AudioUnit altUnit;
+static _Atomic(bool) altInstalled;
+static NSString *altFailReason;
+
+// Called on Spotify's audio thread. Do NOT allocate / lock here.
+static OSStatus evAltRenderNotify(void *refCon,
+                                  AudioUnitRenderActionFlags *flags,
+                                  const AudioTimeStamp *ts,
+                                  UInt32 bus,
+                                  UInt32 frames,
+                                  AudioBufferList *data)
+{
+    if (!flags || !(*flags & kAudioUnitRenderAction_PostRender)) return noErr;
+    if (!data || !frames) return noErr;
+    if (!atomic_load_explicit(&capturing, memory_order_relaxed)) return noErr;
+
+    AudioUnit unit = (AudioUnit)refCon;
+    if (!atomic_load_explicit(&formatReady, memory_order_acquire))
+        inspectFormat(unit);                    // safe: reads AU property
+    if (atomic_load_explicit(&formatReady, memory_order_acquire)) {
+        if (frames >= 1024 && data->mNumberBuffers > 0
+            && data->mBuffers[0].mNumberChannels == 1
+            && data->mBuffers[0].mData) {
+            updateBassLevel((const float *)data->mBuffers[0].mData, frames);
+        }
+
+        uint64_t n = atomic_fetch_add_explicit(&statCalls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&statMatched, 1, memory_order_relaxed);
+        if ((n & 511) == 511) recheckRate(unit);
+        captureBuffers(data, frames);
+    }
+    return noErr;
+}
+
+static BOOL evInstallAlternate(AudioUnit unit) {
+    if (!unit) return NO;
+    if (atomic_load(&altInstalled)) {
+        if (altUnit == unit) return YES;
+        // If it's a different unit, the old one is already stopped/dead.
+        // Do NOT call RemoveRenderNotify here; hookAudioOutputUnitStop handles it.
+        atomic_store(&altInstalled, false);
+        altUnit = NULL;
+    }
+    OSStatus st = AudioUnitAddRenderNotify(unit, evAltRenderNotify, (void *)unit);
+    if (st != noErr) {
+        @synchronized(evSync()) {
+            altFailReason = [NSString stringWithFormat:
+                @"AudioUnitAddRenderNotify failed (OSStatus %d).", (int)st];
+        }
+        EVW("Alt", @"%@", altFailReason);
+        return NO;
+    }
+    altUnit = unit;
+    atomic_store(&altInstalled, true);
+    EVI("Alt", @"render-notify installed on AU %p", (void *)unit);
+    return YES;
+}
+
+static void evRemoveAlternate(void) {
+    if (atomic_load(&altInstalled) && altUnit) {
+        AudioUnitRemoveRenderNotify(altUnit, evAltRenderNotify, (void *)altUnit);
+        atomic_store(&altInstalled, false);
+        altUnit = NULL;
+    }
+}
+
+// Verify `val` is a heap-allocated, readable, non-executable pointer.
+// AudioUnit handles always satisfy this; ObjC object pointers, code
+// pointers, and zeroed __TEXT bytes do not.
+static bool evIsPlausibleAudioUnit(uintptr_t val) {
+    if (!val || (val & 0x7) != 0) return false;
+    // Reject any pointer that resolves inside a loaded image (__TEXT or __DATA).
+    // AudioUnit handles are heap allocations, so an image-internal pointer here
+    // is always a spurious ivar (code pointer, zeroed __DATA slot, etc).
+    Dl_info di = {0};
+    if (dladdr((void *)val, &di) && di.dli_fname) return false;
+    // Reject if the first word is null. AudioUnitGetProperty reads it as a
+    // dispatch-table pointer and branches through it; a null first word
+    // produces EXC_BAD_ACCESS at pc=0 inside AudioToolboxCore.
+    if (!*(volatile uintptr_t *)val) return false;
+    return true;
+}
+
+// Walk an object's ivars looking for an AudioUnit (probe with a real property read).
+static AudioUnit evFindAudioUnit(id obj) {
+    if (!obj) return NULL;
+    Class cls = object_getClass(obj);
+    while (cls && cls != [NSObject class]) {
+        unsigned n = 0;
+        Ivar *iv = class_copyIvarList(cls, &n);
+        for (unsigned i = 0; i < n; i++) {
+            const char *enc = ivar_getTypeEncoding(iv[i]);
+            if (!enc || (enc[0] != '@' && enc[0] != '^')) continue;
+            uintptr_t val = *(uintptr_t *)((uint8_t *)(__bridge void *)obj + ivar_getOffset(iv[i]));
+            if (!val) continue;
+            // Second guard: verify val is actually in a readable heap region
+            // before we hand it to a CoreAudio function that will dereference it.
+            if (!evIsPlausibleAudioUnit(val)) continue;
+            AudioStreamBasicDescription asbd = {0};
+            UInt32 sz = sizeof(asbd);
+            OSStatus st = AudioUnitGetProperty((AudioUnit)val,
+                                               kAudioUnitProperty_StreamFormat,
+                                               kAudioUnitScope_Output, 0, &asbd, &sz);
+            if (st == noErr) {
+                EVI("Alt", @"found AU %p on %s.%s (rate=%.0f ch=%u)",
+                    (void *)val, class_getName(cls), ivar_getName(iv[i]),
+                    asbd.mSampleRate, asbd.mChannelsPerFrame);
+                free(iv);
+                return (AudioUnit)val;
+            }
+        }
+        free(iv);
+        cls = class_getSuperclass(cls);
+    }
+    return NULL;
+}
+
 #pragma mark - Writer thread
 
 static void evPersistMarkers(void) {
@@ -430,6 +866,7 @@ static void *writerMain(void *unused) {
     float temp[WRITE_CHUNK];
     uint64_t written = 0;
     uint64_t lastStat = evNowMs(), lastHdr = lastStat, lastCaller = lastStat;
+    uint64_t lastDiskCheck = lastStat;
     uint64_t prevCalls = 0, prevCaptured = 0, prevFramesRef = 0;
     int silentStreak = 0; bool silenceWarned = false, abortHandled = false;
 
@@ -439,6 +876,33 @@ static void *writerMain(void *unused) {
         if (r < w) {
             uint32_t count = (uint32_t)(w - r);
             if (count > WRITE_CHUNK) count = WRITE_CHUNK;
+
+            // Never write beyond the classic WAV payload limit.
+            if (written >= WAV_MAX_BYTES) {
+                if (!abortHandled) {
+                    abortHandled = true;
+                    setLastError(@"Recording reached the 4 GB WAV limit and was stopped; the captured audio is being saved.");
+                    EVW("Writer", @"4 GB WAV payload limit reached - stopping");
+                    atomic_store(&capturing, false);
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        EeveeAudioRecorderStop();
+                    });
+                }
+                break;
+            }
+
+            uint64_t remainingSamples =
+                (WAV_MAX_BYTES - written) / sizeof(float);
+            if (count > remainingSamples)
+                count = (uint32_t)remainingSamples;
+            if (!count) {
+                atomic_store(&capturing, false);
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    EeveeAudioRecorderStop();
+                });
+                break;
+            }
+
             uint32_t pos = (uint32_t)(r & (RING_SAMPLES - 1));
             uint32_t first = RING_SAMPLES - pos;
             if (first > count) first = count;
@@ -456,12 +920,15 @@ static void *writerMain(void *unused) {
             }
             written += done * sizeof(float);
             atomic_store_explicit(&readIndex, r + (done ? done : count), memory_order_release);
-            if (written > WAV_MAX_BYTES && !abortHandled) {
+            if (written >= WAV_MAX_BYTES && !abortHandled) {
                 abortHandled = true;
-                setLastError(@"Recording reached the 4 GB WAV limit and was stopped.");
-                EVW("Writer", @"4 GB WAV limit reached - stopping");
+                setLastError(@"Recording reached the 4 GB WAV limit and was stopped; the captured audio is being saved.");
+                EVW("Writer", @"4 GB WAV payload limit reached - stopping");
                 atomic_store(&capturing, false);
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ EeveeAudioRecorderStop(); });
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    EeveeAudioRecorderStop();
+                });
+                break;
             }
         } else if (!atomic_load(&capturing)) {
             break;
@@ -470,6 +937,33 @@ static void *writerMain(void *unused) {
         }
 
         uint64_t now = evNowMs();
+
+        // Leave a storage reserve so recording cannot fill the device.
+        if (now - lastDiskCheck >= 2000) {
+            lastDiskCheck = now;
+            @autoreleasepool {
+                NSDictionary *fs = [[NSFileManager defaultManager]
+                    attributesOfFileSystemForPath:NSHomeDirectory()
+                    error:nil];
+                uint64_t freeBytes =
+                    [fs[NSFileSystemFreeSize] unsignedLongLongValue];
+
+                if (freeBytes < MIN_FREE_STOP_BYTES && !abortHandled) {
+                    abortHandled = true;
+                    setLastError([NSString stringWithFormat:
+                        @"Recording stopped to protect storage: only %.0f MB remain. Captured audio is being saved.",
+                        (double)freeBytes / (1024.0 * 1024.0)]);
+                    EVW("Writer",
+                        @"free storage dropped below %.0f MB - stopping safely",
+                        (double)MIN_FREE_STOP_BYTES / (1024.0 * 1024.0));
+                    atomic_store(&capturing, false);
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        EeveeAudioRecorderStop();
+                    });
+                }
+            }
+        }
+
         if (atomic_load(&abortFlag) && !abortHandled) {
             abortHandled = true;
             uint32_t nr = atomic_load(&mismatchRate);
@@ -526,12 +1020,104 @@ static BOOL evFail(NSString *msg) {
     return NO;
 }
 
+// Steal the AudioUnit handle when Spotify starts playback
+static OSStatus (*origAudioOutputUnitStart)(AudioUnit unit);
+static OSStatus (*origAudioOutputUnitStop)(AudioUnit unit);
+
+static OSStatus hookAudioOutputUnitStart(AudioUnit unit) {
+    if (EeveeAudioRecorderIsRecording()) {
+        if (!atomic_load(&altInstalled) || altUnit != unit) {
+            evInstallAlternate(unit);
+        }
+    }
+    return origAudioOutputUnitStart(unit);
+}
+
+static OSStatus hookAudioOutputUnitStop(AudioUnit unit) {
+    // Safely detach BEFORE the OS destroys the unit
+    if (atomic_load(&altInstalled) && altUnit == unit) {
+        AudioUnitRemoveRenderNotify(altUnit, evAltRenderNotify, (void *)altUnit);
+        atomic_store(&altInstalled, false);
+        altUnit = NULL;
+    }
+    return origAudioOutputUnitStop(unit);
+}
+
+static BOOL evTryAlternate(void) {
+    if (atomic_load(&altInstalled)) return YES;
+
+    Class cls = NSClassFromString(@"SPTAudioDriverImplementation");
+    if (cls) {
+        for (NSString *sel in @[@"sharedInstance", @"sharedDriver", @"defaultDriver"]) {
+            SEL s = NSSelectorFromString(sel);
+            if (![cls respondsToSelector:s]) continue;
+            id inst = ((id (*)(id, SEL))objc_msgSend)(cls, s);
+            AudioUnit u = evFindAudioUnit(inst);
+            if (u && evInstallAlternate(u)) return YES;
+        }
+    }
+
+    // If that fails, hook AudioOutputUnitStart to grab the AU handle dynamically
+    if (!origAudioOutputUnitStart) {
+        struct rebinding b_start = {
+            "AudioOutputUnitStart",
+            (void *)hookAudioOutputUnitStart,
+            (void **)&origAudioOutputUnitStart
+        };
+        struct rebinding b_stop = {
+            "AudioOutputUnitStop",
+            (void *)hookAudioOutputUnitStop,
+            (void **)&origAudioOutputUnitStop
+        };
+        if (rebind_symbols(&b_start, 1) == 0 && origAudioOutputUnitStart &&
+            rebind_symbols(&b_stop, 1) == 0 && origAudioOutputUnitStop) {
+            EVI("Alt", @"Hooked AudioOutputUnitStart and Stop.");
+        } else {
+            EVW("Alt", @"Failed to hook AudioOutputUnit lifecycle.");
+            return NO;
+        }
+    }
+
+    // Return YES so the recorder doesn't fall back to the crashing inline hook.
+    return YES;
+}
+
+// Route the start request to the selected capture method. If alternate was chosen
+// but could not attach, record why and fall back to the inline hook.
+static BOOL evEnsureCaptureReady(void) {
+    NSString *sel = evCaptureSelectedMethod();
+
+    if ([sel isEqualToString:@"auto"]) {
+        if (installPumpHook())          return YES;
+        if (installConverterHookOnce()) return YES;
+        return installHookOnce();
+    }
+    if ([sel isEqualToString:@"bmtaptap"])  return installBMTapHook();
+    if ([sel isEqualToString:@"pump"])      return installPumpHook();
+    if ([sel isEqualToString:@"converter"]) return installConverterHookOnce();
+    if ([sel isEqualToString:@"audiounit"]) return installHookOnce();
+
+    // alternate selected
+    if (evTryAlternate()) return YES;
+
+    @synchronized(evSync()) {
+        if (!captureFallbackReason) {
+            captureFallbackReason = altFailReason ?: @"Alternate capture could not attach to Spotify's AudioUnit.";
+        }
+    }
+    atomic_store(&captureFallbackUsed, true);
+    EVW("Core", @"alternate refused: %@; falling back to AudioUnitRender.", captureFallbackReason);
+    return installHookOnce();
+}
+
 static BOOL evStartLocked(void) {
     if (atomic_load(&sessionActive)) return YES;
+    if (atomic_load(&finalizing))
+        return evFail(@"The previous recording is still being finalized. Wait for track saving to finish.");
     setLastError(nil);
     EVI("Core", @"Start requested");
     evLogEnvironment();
-    if (!installHookOnce()) return NO;
+    if (!evEnsureCaptureReady()) return NO;
 
     NSDictionary *fs = [[NSFileManager defaultManager] attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
     if ([fs[NSFileSystemFreeSize] unsignedLongLongValue] < MIN_FREE_BYTES)
@@ -586,6 +1172,7 @@ void EeveeAudioRecorderStop(void) {
     if (!atomic_load(&sessionActive)) { pthread_mutex_unlock(&ctlLock); return; }
     EVI("Core", @"Stop requested");
     atomic_store(&capturing, false);
+    evRemoveAlternate();
     EVMetaStop();
     if (threadStarted) { pthread_join(writerThread, NULL); threadStarted = false; }
     NSURL *wav = sessionWav;
@@ -593,6 +1180,7 @@ void EeveeAudioRecorderStop(void) {
     uint32_t rate = EVCoreSampleRate();
     NSArray<EVMarker *> *snapshot; @synchronized(evSync()) { snapshot = [markers copy]; }
     evPersistMarkers();
+    atomic_store(&finalizing, true);
     atomic_store(&sessionActive, false);
     pthread_mutex_unlock(&ctlLock);
     evPostState();
@@ -602,6 +1190,8 @@ void EeveeAudioRecorderStop(void) {
         NSURL *first = files.firstObject;
         if (first) outputPath = first.path;
         lastSessionSummary = [NSString stringWithFormat:@"%lu track(s) in %@", (unsigned long)tracks.count, folder.lastPathComponent];
+        atomic_store(&finalizing, false);
+        evPostState();
         dispatch_async(dispatch_get_main_queue(), ^{
             [[NSNotificationCenter defaultCenter] postNotificationName:EeveeRecorderDidFinishNotification object:nil
                 userInfo:@{@"files": files ?: @[], @"folder": folder ?: [NSNull null], @"tracks": tracks ?: @[], @"error": error ?: @""}];
@@ -615,6 +1205,7 @@ NSString *EeveeAudioRecorderCurrentPath(void) { return outputPath; }
 NSString *EeveeRecorderStatusLine(void) {
     if (atomic_load(&sessionActive))
         return [NSString stringWithFormat:@"Recording %@", EVFormatTime((double)EVCoreFramesCaptured() / EVCoreSampleRate())];
+    if (atomic_load(&finalizing)) return @"Saving tracks…";
     NSString *e = EeveeAudioRecorderLastError();
     if (e.length) return [@"Not recording - " stringByAppendingString:e];
     return lastSessionSummary.length ? [@"Idle - last: " stringByAppendingString:lastSessionSummary] : @"Idle";
@@ -627,6 +1218,15 @@ NSArray<NSString *> *EVCoreDebugLines(void) {
     NSMutableArray *l = [NSMutableArray array];
     [l addObject:[NSString stringWithFormat:@"== Core ==\nbuild %s %s | pid %d", __DATE__, __TIME__, getpid()]];
     [l addObject:[NSString stringWithFormat:@"hook: %@ (state %d) %@", hookMode, atomic_load(&hookState), hookError ? [@"| error: " stringByAppendingString:hookError] : @""]];
+    [l addObject:[NSString stringWithFormat:@"alt: installed=%d unit=%p fail=%@",
+        atomic_load(&altInstalled), (void *)altUnit, altFailReason ?: @"none"]];
+    {
+        NSString *__fb = EVCaptureFallbackReason();
+        [l addObject:[NSString stringWithFormat:@"capture: selected=%@ active=%@ fallback=%@%@",
+            EVCaptureMethodSelected(), EVCaptureMethodActive(),
+            atomic_load(&captureFallbackUsed) ? @"yes" : @"no",
+            __fb ? [NSString stringWithFormat:@" (%@)", __fb] : @""]];
+    }
     [l addObject:[NSString stringWithFormat:@"JIT: CS_DEBUGGED=%d P_TRACED=%d MAP_JIT=%d (cs=0x%08x) force=%d", dbg, trc, jit, cs, EVSettingBool(@"forceInline", NO)]];
     [l addObject:[NSString stringWithFormat:@"last error: %@", EeveeAudioRecorderLastError() ?: @"none"]];
     [l addObject:[NSString stringWithFormat:@"recording: %d | session: %@", atomic_load(&sessionActive), sessionDir.lastPathComponent ?: @"-"]];
@@ -671,10 +1271,20 @@ static void evProbeDump(id obj, const char *label) {
 }
 
 static void evProbeCommon(int idx, id self_, SEL cmd, id arg) {
-    EVI("Probe", @"%s (arg=%@)", evProbeSels[idx], arg ? NSStringFromClass(object_getClass(arg)) : @"nil");
-    if (idx == 1) { evProbeDump(self_, "self"); if (arg) evProbeDump(arg, "arg"); }
+    // NEVER call NSStringFromClass or evProbeDump on `arg`. Spotify passes
+    // raw pointers / AudioUnit handles / Swift values here — not ObjC objects.
+    // Doing so triggers libobjc's class_rw_t corruption trap (#brk 0xc473).
+	EVI("Probe", @"%s (self=%p arg=%p)", evProbeSels[idx], (__bridge void *)self_, (__bridge void *)arg);
+    if (idx == 1) {                                 // audioDriverDidStartRunning:
+        evProbeDump(self_, "self");                 // self_ IS SPTAudioDriverImplementation
+        if ([evCaptureSelectedMethod() isEqualToString:@"alternate"]) {
+            AudioUnit u = evFindAudioUnit(self_);
+            if (u) evInstallAlternate(u);
+        }
+    }
     if (evProbeOrig[idx]) ((void (*)(id, SEL, id))evProbeOrig[idx])(self_, cmd, arg);
 }
+
 static void evProbe0(id s, SEL c, id a) { evProbeCommon(0, s, c, a); }
 static void evProbe1(id s, SEL c, id a) { evProbeCommon(1, s, c, a); }
 static void evProbe2(id s, SEL c, id a) { evProbeCommon(2, s, c, a); }
@@ -698,7 +1308,30 @@ static void evProbeInstall(void) {
 __attribute__((constructor)) static void evCoreInit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         EVI("Core", @"recorder loaded: build %s %s pid %d", __DATE__, __TIME__, getpid());
-        if (EVSettingBool(@"probeDriver", NO)) evProbeInstall();
+        // Probe when explicitly enabled OR when the alternate method is selected
+        // (the alternate needs the probe to discover Spotify's AudioUnit).
+        BOOL needProbe = EVSettingBool(@"probeDriver", NO)
+                      || [evCaptureSelectedMethod() isEqualToString:@"alternate"];
+        if (needProbe) evProbeInstall();
         EVResumePendingSessions();
     });
+}
+
+#pragma mark - Capture method diagnostics
+
+NSString *EVCaptureMethodSelected(void) { return evCaptureSelectedMethod(); }
+
+NSString *EVCaptureMethodActive(void) {
+    if (bmTapInstalled) return @"bmtaptap";
+    if (atomic_load(&altInstalled)) return @"alternate";
+    if (atomic_load(&hookState) == 1) {
+        if ([hookMode isEqualToString:@"inline(converter)"]) return @"converter";
+        if ([hookMode hasPrefix:@"pump"]) return @"pump";
+        return @"audiounit";
+    }
+    return @"none";
+}
+
+NSString *EVCaptureFallbackReason(void) {
+    @synchronized(evSync()) { return captureFallbackReason; }
 }

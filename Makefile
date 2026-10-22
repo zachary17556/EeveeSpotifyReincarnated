@@ -18,10 +18,14 @@ $(shell mkdir -p Sources/EeveeSpotify/Generated)
 $(shell printf 'enum GeneratedConfig {\n    static let repoSlug = "%s"\n    static let branchName = "%s"\n}\n' "$(REPO_SLUG_FINAL)" "$(BRANCH_NAME_FINAL)" > Sources/EeveeSpotify/Generated/.RepoSlug.tmp; cmp -s Sources/EeveeSpotify/Generated/.RepoSlug.tmp Sources/EeveeSpotify/Generated/RepoSlug.swift || cp Sources/EeveeSpotify/Generated/.RepoSlug.tmp Sources/EeveeSpotify/Generated/RepoSlug.swift)
 
 EeveeSpotify_FILES = $(shell find Sources/EeveeSpotify -name '*.swift') $(shell find Sources/EeveeSpotifyC -name '*.m' -o -name '*.c' -o -name '*.mm' -o -name '*.cpp') modules/fishhook/fishhook.c
+EeveeSpotify_FILES += Vendor/flac-1.5.0/src/libFLAC/bitmath.c Vendor/flac-1.5.0/src/libFLAC/bitreader.c Vendor/flac-1.5.0/src/libFLAC/bitwriter.c Vendor/flac-1.5.0/src/libFLAC/cpu.c Vendor/flac-1.5.0/src/libFLAC/crc.c Vendor/flac-1.5.0/src/libFLAC/fixed.c Vendor/flac-1.5.0/src/libFLAC/float.c Vendor/flac-1.5.0/src/libFLAC/format.c Vendor/flac-1.5.0/src/libFLAC/lpc.c Vendor/flac-1.5.0/src/libFLAC/md5.c Vendor/flac-1.5.0/src/libFLAC/memory.c Vendor/flac-1.5.0/src/libFLAC/metadata_iterators.c Vendor/flac-1.5.0/src/libFLAC/metadata_object.c Vendor/flac-1.5.0/src/libFLAC/stream_decoder.c Vendor/flac-1.5.0/src/libFLAC/stream_encoder.c Vendor/flac-1.5.0/src/libFLAC/stream_encoder_framing.c Vendor/flac-1.5.0/src/libFLAC/window.c
+EeveeSpotify_CFLAGS += -IVendor/flac-1.5.0/include -IVendor/flac-1.5.0/src/libFLAC/include -DFLAC__HAS_OGG=0 -DFLAC__HAS_X86INTRIN=0 -DFLAC__NO_ASM -DFLAC__NO_DLL
+
 EeveeSpotify_SWIFTFLAGS = -ISources/EeveeSpotifyC/include $(if $(DEV),-Onone,-Osize)
 EeveeSpotify_SWIFTFLAGS += -I$(PB_DIR)
 EeveeSpotify_LDFLAGS += -Xlinker -force_load -Xlinker $(PB_DIR)/libEeveeSwiftProtobuf.a
 EeveeSpotify_CFLAGS = -fobjc-arc -ISources/EeveeSpotifyC/include $(if $(DEV),-O0,-Os)
+EeveeSpotify_CFLAGS += -IVendor/flac-1.5.0/include -IVendor/flac-1.5.0/src/libFLAC/include -DFLAC__HAS_OGG=0 -DFLAC__HAS_X86INTRIN=0 -DFLAC__NO_ASM -DFLAC__NO_DLL -DPACKAGE_VERSION=\"1.5.0\" -DHAVE_LROUND=1 -DHAVE_INTTYPES_H=1
 
 # RootHide's compatibility implementation of libroot resolves jailbreak paths
 # through libroothide at runtime. Rootless builds continue to use libroot.

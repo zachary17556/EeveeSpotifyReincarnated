@@ -83,46 +83,366 @@ static NSArray<UIView *> *EVLottieCandidates(void) {
 
 #pragma mark - Button
 
+typedef NS_ENUM(NSInteger, EVBtnMode) { EVBtnIdle, EVBtnStarting, EVBtnRecording, EVBtnSaving, EVBtnSaved, EVBtnFailed };
+
+static UIColor *EVHex(uint32_t rgb) {
+    return [UIColor colorWithRed:((rgb >> 16) & 255) / 255.0 green:((rgb >> 8) & 255) / 255.0 blue:(rgb & 255) / 255.0 alpha:1];
+}
+
+// Uses Spotify's own Circular font when it is registered, the system font otherwise.
+static UIFont *EVButtonFont(CGFloat size) {
+    for (NSString *family in UIFont.familyNames) {
+        if ([family rangeOfString:@"circular" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+        NSArray<NSString *> *names = [UIFont fontNamesForFamilyName:family];
+        NSString *pick = nil;
+        for (NSString *n in names) {
+            if ([n rangeOfString:@"bold" options:NSCaseInsensitiveSearch].location != NSNotFound) { pick = n; break; }
+        }
+        if (!pick) pick = names.firstObject;
+        UIFont *f = pick ? [UIFont fontWithName:pick size:size] : nil;
+        if (f) return f;
+    }
+    return [UIFont systemFontOfSize:size weight:UIFontWeightSemibold];
+}
+
 @interface EVRecButton : UIControl
-@property (nonatomic, strong) UIView *ring, *dot;
 - (void)showIdle;
-- (void)showSolidRed;
-- (void)showBlink;
-- (void)showWarning;
+- (void)showStarting;
+- (void)showSolidRed;   // kept for compatibility: same as showBlink
+- (void)showBlink;      // recording
+- (void)showSaving;
+- (void)showSaved;
+- (void)showFailed;
+- (void)showWarning;    // could not start
 @end
 
-@implementation EVRecButton
+@implementation EVRecButton {
+    EVBtnMode _mode;
+    NSUInteger _token;
+    UIView *_pill, *_icon, *_dot, *_wave;
+    CAShapeLayer *_ring;
+    UIActivityIndicatorView *_spinner;
+    UIImageView *_glyph;
+    UILabel *_label;
+    NSMutableArray<CALayer *> *_bars;
+    NSTimer *_ticker;
+    UIImpactFeedbackGenerator *_impact;
+    UINotificationFeedbackGenerator *_notify;
+    NSString *_failText;
+    UIColor *_failColor;
+    BOOL _wantsWave, _wantsText;
+}
+
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f];
     if (!self) return nil;
-    _ring = [UIView new]; _ring.userInteractionEnabled = NO;
-    _ring.layer.borderWidth = 2; _ring.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.9].CGColor;
-    _dot = [UIView new]; _dot.userInteractionEnabled = NO;
-    [self addSubview:_ring]; [self addSubview:_dot];
-    self.isAccessibilityElement = YES; self.accessibilityLabel = @"Record";
-    [self showIdle];
+    self.clipsToBounds = NO;
+    _impact = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    _notify = [UINotificationFeedbackGenerator new];
+
+    _pill = [UIView new];
+    _pill.userInteractionEnabled = NO;
+    _pill.layer.cornerRadius = 22;
+    _pill.layer.shadowOffset = CGSizeMake(0, 2);
+    _pill.layer.shadowRadius = 8;
+    [self addSubview:_pill];
+
+    _icon = [[UIView alloc] initWithFrame:CGRectMake(8, 8, 28, 28)];
+    _icon.userInteractionEnabled = NO;
+    [_pill addSubview:_icon];
+
+    _ring = [CAShapeLayer layer];
+    _ring.frame = CGRectMake(0, 0, 28, 28);
+    _ring.path = [UIBezierPath bezierPathWithArcCenter:CGPointMake(14, 14) radius:12.5
+                                            startAngle:-M_PI_2 endAngle:3 * M_PI_2 clockwise:YES].CGPath;
+    _ring.fillColor = UIColor.clearColor.CGColor;
+    _ring.strokeColor = EVHex(0xFF3B30).CGColor;
+    _ring.lineWidth = 2.5;
+    _ring.lineCap = kCALineCapRound;
+    _ring.opacity = 0;
+    [_icon.layer addSublayer:_ring];
+
+    _dot = [[UIView alloc] initWithFrame:CGRectMake(8, 8, 12, 12)];
+    _dot.layer.cornerRadius = 6;
+    [_icon addSubview:_dot];
+
+    _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    _spinner.color = UIColor.whiteColor;
+    _spinner.hidesWhenStopped = NO;
+    _spinner.alpha = 0;
+    _spinner.center = CGPointMake(14, 14);
+    [_icon addSubview:_spinner];
+
+    _glyph = [[UIImageView alloc] initWithFrame:_icon.bounds];
+    _glyph.contentMode = UIViewContentModeCenter;
+    _glyph.alpha = 0;
+    [_icon addSubview:_glyph];
+
+    _wave = [[UIView alloc] initWithFrame:CGRectMake(0, 13, 30, 18)];
+    _wave.userInteractionEnabled = NO;
+    _wave.alpha = 0;
+    _bars = [NSMutableArray array];
+    for (int i = 0; i < 5; i++) {
+        CALayer *b = [CALayer layer];
+        b.backgroundColor = UIColor.whiteColor.CGColor;
+        b.cornerRadius = 1.5;
+        b.bounds = CGRectMake(0, 0, 3, 18);
+        b.position = CGPointMake(1.5 + i * 6.75, 9);
+        [_wave.layer addSublayer:b];
+        [_bars addObject:b];
+    }
+    [_pill addSubview:_wave];
+
+    _label = [UILabel new];
+    _label.textColor = UIColor.whiteColor;
+    _label.alpha = 0;
+    [_pill addSubview:_label];
+
+    self.isAccessibilityElement = YES;
+    self.accessibilityTraits = UIAccessibilityTraitButton;
+
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserver:self selector:@selector(refreshAnimations) name:UIApplicationDidBecomeActiveNotification object:nil];
+    [nc addObserver:self selector:@selector(refreshAnimations) name:UIAccessibilityReduceMotionStatusDidChangeNotification object:nil];
+
+    _mode = (EVBtnMode)-1;
+    [self enter:EVBtnIdle];
     return self;
 }
+
+- (void)dealloc {
+    [_ticker invalidate];
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+
+#pragma mark public states
+
+- (void)showIdle { [self enter:EVBtnIdle]; }
+- (void)showStarting { [_impact impactOccurred]; [self enter:EVBtnStarting]; }
+- (void)showSolidRed { [self enter:EVBtnRecording]; }
+- (void)showBlink { [self enter:EVBtnRecording]; }
+- (void)showSaving { [self enter:EVBtnSaving]; }
+- (void)showSaved { [self enter:EVBtnSaved]; }
+- (void)showFailed { _failText = @"Failed"; _failColor = EVHex(0xFF3B30); [self enter:EVBtnFailed]; }
+- (void)showWarning { _failText = @"Cannot start"; _failColor = EVHex(0xFF9500); [self enter:EVBtnFailed]; }
+
+#pragma mark layout
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    return CGRectContainsPoint(CGRectUnion(self.bounds, _pill.frame), point);
+}
+
+// Ignore taps while the previous recording is still being saved.
+- (void)sendAction:(SEL)action to:(id)target forEvent:(UIEvent *)event {
+    if (_mode == EVBtnSaving) return;
+    [super sendAction:action to:target forEvent:event];
+}
+
 - (void)layoutSubviews {
     [super layoutSubviews];
-    CGPoint c = CGPointMake(self.bounds.size.width / 2, self.bounds.size.height / 2);
-    self.ring.bounds = CGRectMake(0, 0, 30, 30); self.ring.center = c; self.ring.layer.cornerRadius = 15;
-    self.dot.bounds = CGRectMake(0, 0, 18, 18); self.dot.center = c; self.dot.layer.cornerRadius = 9;
+    [self layoutPill];
 }
-- (void)showIdle { [self.dot.layer removeAllAnimations]; self.dot.backgroundColor = UIColor.systemGreenColor; }
-- (void)showSolidRed {
-    [self.dot.layer removeAllAnimations];
-    [UIView animateWithDuration:0.25 animations:^{ self.dot.backgroundColor = UIColor.systemRedColor; }];
+
+- (void)layoutPill {
+    CGFloat x = 8 + 28;
+    _icon.frame = CGRectMake(8, 8, 28, 28);
+    if (_wantsWave) { x += 8; _wave.frame = CGRectMake(x, 13, 30, 18); x += 30; }
+    CGFloat labelW = 0;
+    if (_wantsText) {
+        [_label sizeToFit];
+        labelW = ceil(_label.bounds.size.width) + 1;
+        x += 8;
+        _label.frame = CGRectMake(x, 0, labelW, 44);
+        x += labelW;
+    }
+    CGFloat w = MAX(44, x + 8);
+    _pill.frame = CGRectMake((self.bounds.size.width - w) / 2, (self.bounds.size.height - 44) / 2, w, 44);
 }
-- (void)showWarning { [self.dot.layer removeAllAnimations]; self.dot.backgroundColor = UIColor.systemOrangeColor; }
-- (void)showBlink {
-    [self.dot.layer removeAllAnimations];
-    self.dot.backgroundColor = UIColor.systemRedColor;
-    CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"backgroundColor"];
-    a.fromValue = (id)UIColor.systemGrayColor.CGColor;
-    a.toValue = (id)UIColor.systemRedColor.CGColor;
-    a.duration = 0.6; a.autoreverses = YES; a.repeatCount = HUGE_VALF;
-    [self.dot.layer addAnimation:a forKey:@"blink"];
+
+#pragma mark state machine
+
+- (NSString *)elapsedString {
+    uint32_t rate = EVCoreSampleRate();
+    if (!rate) rate = 44100;
+    long total = (long)(EVCoreFramesCaptured() / rate);
+    if (total >= 3600)
+        return [NSString stringWithFormat:@"%ld:%02ld:%02ld", total / 3600, (total % 3600) / 60, total % 60];
+    return [NSString stringWithFormat:@"%ld:%02ld", total / 60, total % 60];
+}
+
+- (void)enter:(EVBtnMode)m {
+    if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ [self enter:m]; }); return; }
+    if (m == _mode && m != EVBtnFailed) return;
+    _mode = m;
+    NSUInteger tok = ++_token;
+    [_ticker invalidate]; _ticker = nil;
+
+    UIColor *green = EVHex(0x1ED760), *red = EVHex(0xFF3B30), *dark = [UIColor colorWithWhite:0.10 alpha:0.96];
+    UIColor *bg = dark, *shadow = UIColor.blackColor, *dotColor = red, *glyphColor = nil;
+    float shadowOp = 0.25f;
+    BOOL showDot = NO, showRing = NO, showSpin = NO, showWave = NO;
+    CGFloat dotScale = 1;
+    NSString *text = nil, *glyphName = nil;
+
+    switch (m) {
+        case EVBtnIdle:
+            bg = green; shadow = green; shadowOp = 0.30f; dotColor = [UIColor colorWithWhite:0.07 alpha:1]; showDot = YES;
+            break;
+        case EVBtnStarting:
+            showDot = YES; showRing = YES; dotScale = 0.7;
+            break;
+        case EVBtnRecording:
+            shadow = red; showDot = YES; showRing = YES; showWave = YES; text = [self elapsedString];
+            break;
+        case EVBtnSaving:
+            showSpin = YES; text = @"Saving\u2026";
+            break;
+        case EVBtnSaved:
+            shadow = green; glyphName = @"checkmark"; glyphColor = green; text = @"Saved";
+            break;
+        case EVBtnFailed:
+            shadow = _failColor ?: red; glyphName = @"exclamationmark"; glyphColor = _failColor ?: red; text = _failText ?: @"Failed";
+            break;
+    }
+
+    _label.text = text;
+    _label.font = (m == EVBtnRecording) ? [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightSemibold] : EVButtonFont(14);
+    if (glyphName) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightBold];
+        _glyph.image = [UIImage systemImageNamed:glyphName withConfiguration:cfg];
+        _glyph.tintColor = glyphColor;
+    }
+    _pill.layer.shadowColor = shadow.CGColor;
+    _pill.layer.shadowOpacity = shadowOp;
+    if (showSpin) [_spinner startAnimating]; else [_spinner stopAnimating];
+    _wantsWave = showWave;
+    _wantsText = (text != nil);
+
+    void (^changes)(void) = ^{
+        self->_pill.backgroundColor = bg;
+        self->_dot.backgroundColor = dotColor;
+        self->_dot.alpha = showDot ? 1 : 0;
+        self->_dot.transform = CGAffineTransformMakeScale(dotScale, dotScale);
+        self->_ring.opacity = showRing ? 1 : 0;
+        self->_spinner.alpha = showSpin ? 1 : 0;
+        self->_glyph.alpha = glyphName ? 1 : 0;
+        self->_wave.alpha = showWave ? 1 : 0;
+        self->_label.alpha = text ? 1 : 0;
+        [self layoutPill];
+    };
+    UIViewAnimationOptions opts = UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction;
+    if (self.window == nil) {
+        changes();
+    } else if (UIAccessibilityIsReduceMotionEnabled()) {
+        [UIView animateWithDuration:0.15 delay:0 options:opts animations:changes completion:nil];
+    } else {
+        [UIView animateWithDuration:0.45 delay:0 usingSpringWithDamping:0.78 initialSpringVelocity:0.3
+                            options:opts animations:changes completion:nil];
+    }
+
+    [self refreshAnimations];
+
+    switch (m) {
+        case EVBtnIdle:
+            self.accessibilityLabel = @"Record audio"; self.accessibilityHint = @"Double tap to start recording"; self.accessibilityValue = nil;
+            break;
+        case EVBtnStarting:
+            self.accessibilityLabel = @"Starting recording"; self.accessibilityHint = nil;
+            break;
+        case EVBtnRecording:
+            self.accessibilityLabel = @"Recording"; self.accessibilityHint = @"Double tap to stop and save"; self.accessibilityValue = text;
+            [self startTicker];
+            break;
+        case EVBtnSaving:
+            self.accessibilityLabel = @"Saving recording"; self.accessibilityHint = nil; self.accessibilityValue = nil;
+            break;
+        case EVBtnSaved:
+            self.accessibilityLabel = @"Recording saved"; self.accessibilityHint = nil;
+            [_notify notificationOccurred:UINotificationFeedbackTypeSuccess];
+            UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"Recording saved");
+            [self returnToIdleAfter:1.6 token:tok];
+            break;
+        case EVBtnFailed:
+            self.accessibilityLabel = @"Recording failed"; self.accessibilityValue = _failText; self.accessibilityHint = nil;
+            [_notify notificationOccurred:UINotificationFeedbackTypeError];
+            UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, _failText ?: @"Recording failed");
+            [self returnToIdleAfter:5.0 token:tok];
+            break;
+    }
+}
+
+- (void)returnToIdleAfter:(NSTimeInterval)seconds token:(NSUInteger)tok {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (self->_token != tok) return;   // state changed meanwhile: ignore the stale return
+        [self enter:EVBtnIdle];
+    });
+}
+
+#pragma mark timer (real captured time, so it stays right if the button re-attaches)
+
+- (void)startTicker {
+    __weak typeof(self) ws = self;
+    _ticker = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { [ws tick]; }];
+}
+
+- (void)tick {
+    if (_mode != EVBtnRecording) return;
+    NSString *s = [self elapsedString];
+    if ([s isEqualToString:_label.text]) return;
+    BOOL widthChanged = s.length != _label.text.length;
+    _label.text = s;
+    self.accessibilityValue = s;
+    if (widthChanged) {
+        [UIView animateWithDuration:0.2 animations:^{ [self layoutPill]; }];
+    } else {
+        [self layoutPill];
+    }
+}
+
+#pragma mark continuous animations
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (self.window) [self refreshAnimations];
+}
+
+- (void)refreshAnimations {
+    BOOL recording = (_mode == EVBtnRecording);
+    BOOL ringActive = (_mode == EVBtnRecording || _mode == EVBtnStarting);
+    BOOL reduce = UIAccessibilityIsReduceMotionEnabled();
+
+    [_ring removeAnimationForKey:@"spin"];
+    if (ringActive && !reduce) {
+        _ring.strokeEnd = 0.72;
+        CABasicAnimation *spin = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+        spin.fromValue = @0;
+        spin.toValue = @(2 * M_PI);
+        spin.duration = 1.4;
+        spin.repeatCount = HUGE_VALF;
+        spin.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+        [_ring addAnimation:spin forKey:@"spin"];
+    } else {
+        _ring.strokeEnd = 1.0;
+    }
+
+    for (NSUInteger i = 0; i < _bars.count; i++) {
+        CALayer *b = _bars[i];
+        [b removeAnimationForKey:@"wave"];
+        if (recording && !reduce) {
+            b.transform = CATransform3DIdentity;
+            CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"transform.scale.y"];
+            a.fromValue = @0.25;
+            a.toValue = @1.0;
+            a.duration = 0.45 + 0.11 * i;
+            a.autoreverses = YES;
+            a.repeatCount = HUGE_VALF;
+            a.timeOffset = 0.13 * i;
+            a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+            [b addAnimation:a forKey:@"wave"];
+        } else {
+            b.transform = CATransform3DMakeScale(1, recording ? 0.6 : 0.3, 1);
+        }
+    }
 }
 @end
 
@@ -358,7 +678,7 @@ static NSArray<UIView *> *EVLottieCandidates(void) {
     BOOL rec = EeveeAudioRecorderIsRecording();
     if (self.state == EVRecIdle && rec) { self.state = EVRecRecording; self.token++; [self.button showBlink]; }
     else if (self.state == EVRecRecording && !rec) {
-        self.token++; self.state = EVRecIdle; [self.button showIdle];
+        self.token++; self.state = EVRecIdle; [self.button showSaving];
         NSString *err = EeveeAudioRecorderLastError();
         if (err.length) [self showToastTitle:@"Recording stopped" sub:err image:nil duration:10];
     }
@@ -368,18 +688,18 @@ static NSArray<UIView *> *EVLottieCandidates(void) {
     if (self.state == EVRecStarting || self.state == EVRecStopping) return;
     EVI("UI", @"button tapped in state %ld", (long)self.state);
     if (self.state == EVRecIdle) {
-        self.state = EVRecStarting;
+        self.state = EVRecStarting; [self.button showStarting];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             BOOL ok = EeveeAudioRecorderStart();
             dispatch_async(dispatch_get_main_queue(), ^{ [self startFinished:ok]; });
         });
     } else {
         self.state = EVRecStopping; self.token++;
-        [self.button showIdle];
-        [self showToastTitle:@"Stopped" sub:@"Splitting into tracks..." image:nil duration:4];
+        [self.button showSaving];
+        [self showToastTitle:@"Saving tracks…" sub:@"Finalizing audio and splitting into tracks…" image:nil duration:4];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             EeveeAudioRecorderStop();
-            dispatch_async(dispatch_get_main_queue(), ^{ self.state = EVRecIdle; [self.button showIdle]; });
+            dispatch_async(dispatch_get_main_queue(), ^{ self.state = EVRecIdle; });
         });
     }
 }
@@ -396,13 +716,13 @@ static NSArray<UIView *> *EVLottieCandidates(void) {
     }
     self.state = EVRecRecording;
     NSUInteger t = ++self.token;
-    [self.button showIdle];                                   // green
+    [self.button showBlink];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (self.token != t || self.state != EVRecRecording) return;
-        [self.button showSolidRed];                           // then red
+        /* pill already shows recording */
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (self.token != t || self.state != EVRecRecording) return;
-            [self.button showBlink];                          // then blinking gray/red
+            /* pill already shows recording */
         });
     });
 }
@@ -431,8 +751,10 @@ static NSArray<UIView *> *EVLottieCandidates(void) {
     self.toastSummary = [lines componentsJoinedByString:@"\n"];
     NSString *folderName = [folder isKindOfClass:NSURL.class] ? [(NSURL *)folder lastPathComponent] : @"";
     if (!tracks.count) {
+        [self.button showFailed];
         [self showToastTitle:@"Recording failed" sub:err.length ? err : @"Nothing was saved." image:nil duration:12];
     } else {
+        [self.button showSaved];
         NSString *sub = [NSString stringWithFormat:@"Documents/Recordings/%@%@\nTap to share - hold to copy", folderName, err.length ? [@"\nWarning: " stringByAppendingString:err] : @""];
         [self showToastTitle:[NSString stringWithFormat:@"Saved %lu track%@", (unsigned long)tracks.count, tracks.count == 1 ? @"" : @"s"]
                          sub:sub image:thumb duration:14];
@@ -601,6 +923,7 @@ static NSArray<UIView *> *EVLottieCandidates(void) {
         [ui shareURLs:[ui latestShareables]]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Export last session as AAC (.m4a)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [ws exportLast:@"aac"]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Export last session as Lossless (ALAC .m4a)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [ws exportLast:@"alac"]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Export last session as FLAC (.flac)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [ws exportLast:@"flac"]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Export last session as AIFF (.aiff)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [ws exportLast:@"aiff"]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Dump Lottie views to log" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [ui dumpLottieToLog]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Next anchor candidate" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [ui nextAnchor]; }]];
@@ -639,7 +962,7 @@ static NSArray<UIView *> *EVLottieCandidates(void) {
             EVSetSettingBool(t[0], !on); EVI("UI", @"option %@ -> %d", t[0], !on); [ws options]; }]];
     }
     NSString *fm = EVSettingString(@"exportFormats", @"");
-    for (NSArray *f in @[@[@"aac", @"Also export AAC .m4a"], @[@"alac", @"Also export Lossless .m4a"], @[@"aiff", @"Also export AIFF .aiff"]]) {
+    for (NSArray *f in @[@[@"aac", @"Also export AAC .m4a"], @[@"alac", @"Also export Lossless .m4a"], @[@"aiff", @"Also export AIFF .aiff"], @[@"flac", @"Also export FLAC .flac"]]) {
         BOOL on = [[fm componentsSeparatedByString:@","] containsObject:f[0]];
         [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@ %@", on ? @"[x]" : @"[ ]", f[1]] style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
             NSMutableArray *parts = [NSMutableArray array];

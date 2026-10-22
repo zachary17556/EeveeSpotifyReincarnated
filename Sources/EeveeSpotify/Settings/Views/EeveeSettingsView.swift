@@ -4,12 +4,19 @@ import EeveeSpotifyC
 
 struct EeveeSettingsView: View {
     let navigationController: UINavigationController
-    
+
     @State private var hasShownCommonIssuesTip = UserDefaults.hasShownCommonIssuesTip
     @State private var isClearingData = false
     @State private var isPresentingDevNoteSheet = false
     @State private var isAudioRecording = false
     @State private var audioRecorderMessage: String?
+    @State private var keepSession = false
+    @State private var waitForTrackStart = false
+    @State private var exportFormats: Set<String> = []
+    @State private var recorderLatencyMs = 0
+    @State private var captureMethod = "auto"
+    @State private var captureMethodActive = "unknown"
+    @State private var captureFallbackReason: String? = nil
 
     private func toggleAudioRecording() {
         if isAudioRecording {
@@ -22,6 +29,40 @@ struct EeveeSettingsView: View {
         } else {
             audioRecorderMessage = "Could not start recording."
         }
+    }
+
+    private func loadRecorderSettings() {
+        keepSession = EVSettingBool("keepSession", false)
+        waitForTrackStart = EVSettingBool("waitForTrackStart", false)
+        recorderLatencyMs = EVSettingInt("metaLatencyMs", 0)
+        captureMethod = EVSettingString("captureMethod", "auto") ?? "auto"
+        captureMethodActive = EVCaptureMethodActive() ?? "unknown"
+        captureFallbackReason = EVCaptureFallbackReason()
+
+        let saved = EVSettingString("exportFormats", "") ?? ""
+        exportFormats = Set(saved.split(separator: ",").map(String.init))
+    }
+
+    private func exportFormatBinding(_ key: String) -> Binding<Bool> {
+        Binding(
+            get: { exportFormats.contains(key) },
+            set: { enabled in
+                if enabled {
+                    exportFormats.insert(key)
+                } else {
+                    exportFormats.remove(key)
+                }
+
+                let order = ["aac", "alac", "aiff", "flac"]
+                let saved = order.filter { exportFormats.contains($0) }
+                EVSetSettingString("exportFormats", saved.joined(separator: ","))
+            }
+        )
+    }
+
+    private func adjustRecorderLatency(by delta: Int) {
+        recorderLatencyMs += delta
+        EVSetSettingInt("metaLatencyMs", recorderLatencyMs)
     }
 
     private func exportDebugLog() {
@@ -93,7 +134,7 @@ struct EeveeSettingsView: View {
             .listRowInsets(EdgeInsets())
 
             EeveeSettingsVersionView()
-            
+
             if !hasShownCommonIssuesTip {
                 CommonIssuesTipView(
                     onDismiss: {
@@ -102,14 +143,17 @@ struct EeveeSettingsView: View {
                     }
                 )
             }
-            
+
             ForEach(Self.groups) { group in
                 SettingsGroupSection(group: group) { entry in
                     SettingsNavigator.push(entry.make(), title: entry.key.localized)
                 }
             }
 
-            Section(header: Text("Audio Recording")) {
+            Section(
+                header: Text("Audio Recording"),
+                footer: Text("Recordings are saved under Documents/Recordings. Export formats create additional files from the captured session.")
+            ) {
                 Button(action: toggleAudioRecording) {
                     Label(
                         isAudioRecording ? "Stop Recording" : "Start Recording",
@@ -117,10 +161,109 @@ struct EeveeSettingsView: View {
                     )
                 }
 
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Recorder status")
+                    Spacer(minLength: 12)
+                    Text(EeveeRecorderStatusLine())
+                        .font(.footnote)
+                        .foregroundColor(isAudioRecording ? .red : .secondary)
+                        .multilineTextAlignment(.trailing)
+                }
+
                 if let message = audioRecorderMessage {
                     Text(message)
                         .font(.footnote)
                         .foregroundColor(.secondary)
+                }
+
+                Picker("Capture method", selection: Binding(
+                    get: { captureMethod },
+                    set: { newValue in
+                        guard newValue == "audiounit" || newValue == "alternate" else {
+                            audioRecorderMessage = "// Unblocked alternate capture"
+                            return
+                        }
+                        captureMethod = newValue
+                        EVSetSettingString("captureMethod", newValue)
+                        captureMethodActive = EVCaptureMethodActive() ?? "unknown"
+                        captureFallbackReason = EVCaptureFallbackReason()
+                    }
+                )) {
+                    Text("Auto (Hook)").tag("auto")
+                Text("Converter (Fishhook)").tag("converter")
+                Text("Pump (Inline Hook)").tag("pump")
+                Text("AudioUnitRender").tag("audiounit")
+                Text("Alternate (RenderNotify)").tag("alternate")
+
+                }
+                HStack {
+                    Text("Active method").foregroundColor(.secondary)
+                    Spacer()
+                    Text(captureMethodActive).foregroundColor(.secondary)
+                }
+                if let reason = captureFallbackReason, !reason.isEmpty {
+                    Text("Fallback: \(reason)")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
+
+                Toggle("Keep full session WAV", isOn: Binding(
+                    get: { keepSession },
+                    set: {
+                        keepSession = $0
+                        EVSetSettingBool("keepSession", $0)
+                    }
+                ))
+
+                Toggle("Wait for next track beginning", isOn: Binding(
+                    get: { waitForTrackStart },
+                    set: {
+                        waitForTrackStart = $0
+                        EVSetSettingBool("waitForTrackStart", $0)
+                    }
+                ))
+
+                Text("Additional export formats")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+
+                Toggle("AAC (.m4a)", isOn: exportFormatBinding("aac"))
+                Toggle("ALAC lossless (.m4a)", isOn: exportFormatBinding("alac"))
+                Toggle("AIFF (.aiff)", isOn: exportFormatBinding("aiff"))
+                Toggle("FLAC (.flac)", isOn: exportFormatBinding("flac"))
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Track-start latency")
+                        Text("Adjusts metadata split timing")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        adjustRecorderLatency(by: -25)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .accessibilityLabel("Decrease latency by 25 milliseconds")
+
+                    Text("\(recorderLatencyMs) ms")
+                        .frame(minWidth: 68)
+
+                    Button {
+                        adjustRecorderLatency(by: 25)
+                    } label: {
+                        Image(systemName: "plus.circle")
+                    }
+                    .accessibilityLabel("Increase latency by 25 milliseconds")
+                }
+
+                Button {
+                    EeveeRecorderPresentDebugPanel()
+                } label: {
+                    Label("Recorder Diagnostics", systemImage: "stethoscope")
                 }
             }
 
@@ -187,13 +330,20 @@ struct EeveeSettingsView: View {
             SpacerView()
         }
         .eeveeSettingsStyle()
-        
+
         .animation(.default, value: isClearingData)
         .animation(.default, value: hasShownCommonIssuesTip)
 
         .onAppear {
             WindowHelper.shared.overrideUserInterfaceStyle(.dark)
             isAudioRecording = EeveeAudioRecorderIsRecording()
+            loadRecorderSettings()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSNotification.Name.EeveeRecorderStateDidChange
+        )) { _ in
+            isAudioRecording = EeveeAudioRecorderIsRecording()
+            audioRecorderMessage = EeveeRecorderStatusLine()
         }
     }
 }

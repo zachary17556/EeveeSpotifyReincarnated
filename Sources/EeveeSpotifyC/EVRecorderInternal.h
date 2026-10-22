@@ -69,5 +69,5 @@ NSArray<NSString *> *EVMetaDebugLines(void);
 
 typedef void (^EVFinalizeDone)(NSArray<NSURL *> *files, NSURL *folder, NSArray<NSDictionary *> *tracks, NSString *errorText);
 void EVFinalizeSession(NSURL *sessionWav, uint32_t rate, NSArray<EVMarker *> *markers, uint64_t totalFrames, EVFinalizeDone done);
-void EVExportFolder(NSURL *folder, NSString *format, EVFinalizeDone done);   // format: "aac", "alac", or "aiff"
+void EVExportFolder(NSURL *folder, NSString *format, EVFinalizeDone done);   // format: "aac", "alac", "aiff", or "flac"
 void EVResumePendingSessions(void);

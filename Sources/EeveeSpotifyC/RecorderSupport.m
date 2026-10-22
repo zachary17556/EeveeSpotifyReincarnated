@@ -11,6 +11,7 @@
 #import <math.h>
 #import <mach/mach.h>
 #import <errno.h>
+#import <unistd.h>
 #import "EVRecorderInternal.h"
 
 #pragma mark - Logger
@@ -88,6 +89,98 @@ void EVLogClear(void) {
         [[NSFileManager defaultManager] removeItemAtPath:EVLogPath() error:nil];
         [[NSFileManager defaultManager] removeItemAtPath:[EVLogPath() stringByAppendingString:@".1"] error:nil];
     });
+}
+
+
+#pragma mark - Compact internal crash diagnostics
+
+static NSString *EVCrashReportPath(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return [docs stringByAppendingPathComponent:@"eevee_crash_report.txt"];
+}
+
+static NSString *EVRunMarkerPath(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return [docs stringByAppendingPathComponent:@".eevee_run_active"];
+}
+
+static void EVWriteCrashReport(NSString *reason, NSArray<NSString *> *stack) {
+    @autoreleasepool {
+        NSMutableString *report = [NSMutableString stringWithFormat:
+            @"Eevee internal diagnostic\nDate: %@\nPID: %d\nReason: %@\n",
+            [NSDate date], getpid(), reason ?: @"unknown"];
+        if (stack.count) {
+            [report appendString:@"\nException stack:\n"];
+            NSUInteger limit = MIN(stack.count, (NSUInteger)20);
+            for (NSUInteger i = 0; i < limit; i++)
+                [report appendFormat:@"%@\n", stack[i]];
+        }
+
+        NSString *log = [NSString stringWithContentsOfFile:EVLogPath()
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:nil];
+        if (log.length) {
+            NSArray *lines = [log componentsSeparatedByCharactersInSet:
+                [NSCharacterSet newlineCharacterSet]];
+            NSUInteger begin = lines.count > 60 ? lines.count - 60 : 0;
+            [report appendString:@"\nLast recorder log lines:\n"];
+            for (NSUInteger i = begin; i < lines.count; i++) {
+                if ([lines[i] length])
+                    [report appendFormat:@"%@\n", lines[i]];
+            }
+        }
+        [report writeToFile:EVCrashReportPath()
+                 atomically:YES
+                   encoding:NSUTF8StringEncoding
+                      error:nil];
+    }
+}
+
+static void EVUncaughtExceptionHandler(NSException *exception) {
+    EVWriteCrashReport(
+        [NSString stringWithFormat:@"Uncaught Objective-C exception: %@ — %@",
+            exception.name ?: @"(no name)", exception.reason ?: @"(no reason)"],
+        exception.callStackSymbols);
+}
+
+static void EVInstallInternalCrashDiagnostics(void) {
+    NSSetUncaughtExceptionHandler(&EVUncaughtExceptionHandler);
+
+    NSString *marker = EVRunMarkerPath();
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    // A marker left by the previous run means it ended without the
+    // termination notification. This is evidence of an unclean exit,
+    // not proof that a crash occurred.
+    if ([fm fileExistsAtPath:marker]) {
+        EVWriteCrashReport(
+            [@"Previous launch left the active-run marker. "
+             stringByAppendingString:
+                @"Cause unknown: this does not prove a crash; iOS may terminate an app without a termination notification."],
+            nil);
+    }
+
+    [[NSUUID.UUID.UUIDString dataUsingEncoding:NSUTF8StringEncoding]
+        writeToFile:marker atomically:YES];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationWillTerminateNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification *note) {
+            [fm removeItemAtPath:marker error:nil];
+        }];
+    });
+}
+
+__attribute__((constructor))
+static void EVCrashDiagnosticsConstructor(void) {
+    @autoreleasepool {
+        EVInstallInternalCrashDiagnostics();
+    }
 }
 
 #pragma mark - Settings / paths
@@ -593,8 +686,208 @@ static NSDecimalNumber *EVSec(uint64_t frames, uint32_t rate) {
     return [NSDecimalNumber decimalNumberWithString:[NSString stringWithFormat:@"%.3f", (double)frames / rate]];
 }
 
+
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+#include <FLAC/metadata.h>
+#include <FLAC/stream_encoder.h>
+
+static BOOL EVFLACAddComment(FLAC__StreamMetadata *comment,
+                             NSString *key, id rawValue) {
+    if (!rawValue || rawValue == [NSNull null]) return YES;
+    NSString *value = [rawValue description];
+    if (!value.length) return YES;
+
+    FLAC__StreamMetadata_VorbisComment_Entry entry;
+    if (!FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(
+            &entry, key.UTF8String, value.UTF8String))
+        return NO;
+
+    return FLAC__metadata_object_vorbiscomment_append_comment(
+        comment, entry, true);
+}
+
+static NSString *EVExportFLAC(NSURL *src, NSURL *dst, uint32_t rate,
+                              NSDictionary *tags, NSData *art) {
+    NSData *wav = [NSData dataWithContentsOfURL:src
+                                        options:NSDataReadingMappedAlways
+                                          error:nil];
+    if (wav.length < 44) return @"Source WAV is too short.";
+
+    const uint8_t *bytes = wav.bytes;
+    if (memcmp(bytes, "RIFF", 4) ||
+        memcmp(bytes + 8, "WAVE", 4) ||
+        memcmp(bytes + 36, "data", 4))
+        return @"Source is not the expected float32 stereo WAV.";
+
+    uint32_t sourceRate = (uint32_t)bytes[24]
+        | ((uint32_t)bytes[25] << 8)
+        | ((uint32_t)bytes[26] << 16)
+        | ((uint32_t)bytes[27] << 24);
+    if (!rate) rate = sourceRate;
+    if (!rate || rate > 655350) return @"Invalid sample rate.";
+
+    NSUInteger dataLength = wav.length - 44;
+    NSUInteger frames = dataLength / 8;
+    if (!frames) return @"Source WAV contains no audio frames.";
+
+    FLAC__StreamEncoder *encoder = FLAC__stream_encoder_new();
+    if (!encoder) return @"Could not create FLAC encoder.";
+
+    FLAC__StreamMetadata *comment = FLAC__metadata_object_new(
+        FLAC__METADATA_TYPE_VORBIS_COMMENT);
+    FLAC__StreamMetadata *picture = NULL;
+    FLAC__StreamMetadata *metadata[2];
+    uint32_t metadataCount = 0;
+    BOOL configured = comment != NULL;
+    NSString *failure = nil;
+
+    if (configured) {
+        NSArray *pairs = @[
+            @[@"TITLE", @"title"],
+            @[@"ARTIST", @"artist"],
+            @[@"ALBUM", @"album"],
+            @[@"ALBUMARTIST", @"albumArtist"],
+            @[@"GENRE", @"genre"],
+            @[@"DATE", @"year"],
+            @[@"TRACKNUMBER", @"trackNumber"],
+            @[@"DISCNUMBER", @"discNumber"]
+        ];
+        for (NSArray *pair in pairs) {
+            if (!EVFLACAddComment(comment, pair[0], tags[pair[1]])) {
+                configured = NO;
+                failure = @"Could not add FLAC tag metadata.";
+                break;
+            }
+        }
+        if (configured) metadata[metadataCount++] = comment;
+    } else {
+        failure = @"Could not allocate FLAC tag metadata.";
+    }
+
+    if (configured && art.length && art.length <= UINT32_MAX) {
+        picture = FLAC__metadata_object_new(FLAC__METADATA_TYPE_PICTURE);
+        if (picture) {
+            picture->data.picture.type =
+                FLAC__STREAM_METADATA_PICTURE_TYPE_FRONT_COVER;
+            UIImage *image = [UIImage imageWithData:art];
+            CGImageRef cg = image.CGImage;
+            picture->data.picture.width = cg ? (uint32_t)CGImageGetWidth(cg) : 0;
+            picture->data.picture.height = cg ? (uint32_t)CGImageGetHeight(cg) : 0;
+            picture->data.picture.depth = 24;
+            picture->data.picture.colors = 0;
+
+            if (!FLAC__metadata_object_picture_set_mime_type(
+                    picture, (char *)"image/jpeg", true) ||
+                !FLAC__metadata_object_picture_set_description(
+                    picture, (FLAC__byte *)"", true) ||
+                !FLAC__metadata_object_picture_set_data(
+                    picture, (FLAC__byte *)art.bytes,
+                    (FLAC__uint32)art.length, true)) {
+                FLAC__metadata_object_delete(picture);
+                picture = NULL;
+            } else {
+                metadata[metadataCount++] = picture;
+            }
+        }
+    }
+
+    if (configured)
+        configured = FLAC__stream_encoder_set_channels(encoder, 2) &&
+                     FLAC__stream_encoder_set_bits_per_sample(encoder, 32) &&
+                     FLAC__stream_encoder_set_sample_rate(encoder, rate) &&
+                     FLAC__stream_encoder_set_compression_level(encoder, 5) &&
+                     FLAC__stream_encoder_set_total_samples_estimate(
+                         encoder, (FLAC__uint64)frames) &&
+                     FLAC__stream_encoder_set_metadata(
+                         encoder, metadata, metadataCount);
+
+    if (!configured && !failure)
+        failure = @"Could not configure FLAC encoder.";
+
+    NSString *partialPath = [dst.path stringByAppendingFormat:
+        @".partial-%@", NSUUID.UUID.UUIDString];
+    FLAC__StreamEncoderInitStatus initStatus =
+        FLAC__STREAM_ENCODER_INIT_STATUS_ENCODER_ERROR;
+
+    if (configured) {
+        initStatus = FLAC__stream_encoder_init_file(
+            encoder, partialPath.fileSystemRepresentation, NULL, NULL);
+        if (initStatus != FLAC__STREAM_ENCODER_INIT_STATUS_OK)
+            failure = [NSString stringWithFormat:
+                @"FLAC encoder initialization failed (status %d).",
+                (int)initStatus];
+    }
+
+    if (configured && initStatus == FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
+        const uint8_t *pcm = bytes + 44;
+        const NSUInteger chunkFrames = 4096;
+        FLAC__int32 *samples = calloc(chunkFrames * 2, sizeof(FLAC__int32));
+        if (!samples) {
+            failure = @"Could not allocate FLAC conversion buffer.";
+        } else {
+            for (NSUInteger start = 0; start < frames && !failure;
+                 start += chunkFrames) {
+                NSUInteger count = MIN(chunkFrames, frames - start);
+                for (NSUInteger i = 0; i < count * 2; i++) {
+                    float x;
+                    memcpy(&x, pcm + (start * 2 + i) * 4, sizeof(x));
+                    if (!isfinite(x)) x = 0.0f;
+                    if (x > 1.0f) x = 1.0f;
+                    if (x < -1.0f) x = -1.0f;
+                    double scaled = x < 0.0f
+                        ? (double)x * 2147483648.0
+                        : (double)x * 2147483647.0;
+                    samples[i] = (FLAC__int32)llround(scaled);
+                }
+                if (!FLAC__stream_encoder_process_interleaved(
+                        encoder, samples, (uint32_t)count))
+                    failure = @"FLAC encoding failed while processing audio.";
+            }
+            free(samples);
+        }
+    }
+
+    BOOL finished = FLAC__stream_encoder_finish(encoder);
+    if (!failure && !finished) failure = @"FLAC encoder could not finalize the file.";
+
+    FLAC__stream_encoder_delete(encoder);
+    if (comment) FLAC__metadata_object_delete(comment);
+    if (picture) FLAC__metadata_object_delete(picture);
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (!failure) {
+        NSError *moveError = nil;
+        if ([fm fileExistsAtPath:dst.path])
+            [fm removeItemAtURL:dst error:&moveError];
+        if (!moveError &&
+            ![fm moveItemAtPath:partialPath toPath:dst.path error:&moveError])
+            failure = [NSString stringWithFormat:@"Could not finalize FLAC file: %@",
+                       moveError.localizedDescription];
+        else if (moveError)
+            failure = [NSString stringWithFormat:@"Could not replace export: %@",
+                       moveError.localizedDescription];
+    }
+
+    if (failure) [fm removeItemAtPath:partialPath error:nil];
+    return failure;
+}
+
 static void EVExportOne(NSURL *wav, NSDictionary *tags, NSData *art, uint32_t rate, NSString *fmt,
                         NSMutableArray<NSURL *> *outFiles, NSMutableArray<NSString *> *errs) {
+    if ([fmt isEqualToString:@"flac"]) {
+        NSURL *flac = [[wav URLByDeletingPathExtension] URLByAppendingPathExtension:@"flac"];
+        NSString *flacError = EVExportFLAC(wav, flac, rate, tags, art);
+        if (flacError) {
+            [errs addObject:[NSString stringWithFormat:@"%@: %@", flac.lastPathComponent, flacError]];
+            EVE("Export", @"%@ failed: %@", flac.lastPathComponent, flacError);
+        } else {
+            [outFiles addObject:flac];
+            EVI("Export", @"wrote %@", flac.lastPathComponent);
+        }
+        return;
+    }
     if ([fmt isEqualToString:@"aiff"]) {
         NSURL *aiff = [[wav URLByDeletingPathExtension] URLByAppendingPathExtension:@"aiff"];
         NSString *aiffError = EVExportAIFF(wav, aiff, rate, tags, art);
@@ -626,6 +919,14 @@ static void evRunFinalize(NSURL *wav, uint32_t rate, NSArray<EVMarker *> *marker
     if (!data || data.length < 44) { [errs addObject:@"session.wav is missing or empty"]; return; }
     const uint8_t *b = data.bytes;
     if (memcmp(b, "RIFF", 4) || memcmp(b + 36, "data", 4)) { [errs addObject:@"session.wav has an unexpected header"]; return; }
+    uint32_t channels = (uint32_t)b[22] | ((uint32_t)b[23] << 8);
+    uint16_t bitsPerSample = (uint16_t)b[34] | ((uint16_t)b[35] << 8);
+    uint16_t audioFormat = (uint16_t)b[20] | ((uint16_t)b[21] << 8);
+    if (channels != 2 || bitsPerSample != 32 || audioFormat != 3) { [errs addObject:@"session.wav is not stereo 32-bit float PCM"]; return; }
+    uint64_t payloadBytes = (uint64_t)data.length - 44;
+    if (payloadBytes % 8 != 0) { [errs addObject:@"session.wav ends with an incomplete audio frame"]; return; }
+    uint32_t declaredDataBytes = (uint32_t)b[40] | ((uint32_t)b[41] << 8) | ((uint32_t)b[42] << 16) | ((uint32_t)b[43] << 24);
+    if (declaredDataBytes && declaredDataBytes > payloadBytes) { [errs addObject:@"session.wav header declares audio data that is missing"]; return; }
     if (!rate) rate = b[24] | (b[25] << 8) | (b[26] << 16) | ((uint32_t)b[27] << 24);
     if (!rate) rate = 44100;
     uint64_t avail = (data.length - 44) / 8;
@@ -656,16 +957,40 @@ static void evRunFinalize(NSURL *wav, uint32_t rate, NSArray<EVMarker *> *marker
                            @"partialStart": @(ms[i].partialStart || (i == 0 && ms[i].info == nil)), @"partialEnd": @(i + 1 == ms.count),
                            @"method": @"metadata", @"shiftMs": @0.0} mutableCopy]];
     }
-    // refine each internal boundary
+    // Refine internal boundaries without allowing a snap to cross
+    // neighboring boundaries or create a segment shorter than 1 second.
     for (NSUInteger i = 1; i < segs.count; i++) {
         uint64_t bnd = [segs[i][@"start"] unsignedLongLongValue];
-        double shift; BOOL snapped;
-        uint64_t nb = EVSnapBoundary(pcm, totalFrames, bnd, rate, &shift, &snapped);
+        uint64_t leftStart = [segs[i - 1][@"start"] unsignedLongLongValue];
+        uint64_t rightEnd = [segs[i][@"end"] unsignedLongLongValue];
+        uint64_t minLen = rate;
+        uint64_t lower = leftStart <= UINT64_MAX - minLen
+            ? leftStart + minLen : UINT64_MAX;
+        uint64_t upper = rightEnd >= minLen ? rightEnd - minLen : 0;
+        double shift = 0;
+        BOOL snapped = NO;
+        uint64_t nb = bnd;
+
+        if (lower <= upper && bnd >= lower && bnd <= upper) {
+            nb = EVSnapBoundary(pcm, totalFrames, bnd, rate, &shift, &snapped);
+            if (snapped && (nb < lower || nb > upper)) {
+                snapped = NO;
+                nb = bnd;
+                shift = 0;
+            }
+        }
+
         if (snapped) {
-            segs[i][@"start"] = @(nb); segs[i - 1][@"end"] = @(nb);
-            segs[i][@"method"] = @"energy-valley"; segs[i][@"shiftMs"] = @(shift);
-            EVI("Split", @"boundary %lu snapped %+.1f ms to an energy valley", (unsigned long)i, shift);
-        } else EVI("Split", @"boundary %lu kept at metadata position (no clear silence nearby)", (unsigned long)i);
+            segs[i][@"start"] = @(nb);
+            segs[i - 1][@"end"] = @(nb);
+            segs[i][@"method"] = @"energy-valley";
+            segs[i][@"shiftMs"] = @(shift);
+            EVI("Split", @"boundary %lu snapped %+.1f ms to a safe energy valley",
+                (unsigned long)i, shift);
+        } else {
+            EVI("Split", @"boundary %lu kept at metadata position (no safe energy valley)",
+                (unsigned long)i);
+        }
     }
 
     NSArray<NSString *> *formats = EVExportFormats();
@@ -721,7 +1046,20 @@ static void evRunFinalize(NSURL *wav, uint32_t rate, NSArray<EVMarker *> *marker
         [[NSFileManager defaultManager] removeItemAtURL:wav error:nil];
         EVI("Split", @"removed session.wav (enable 'Keep full session WAV' to keep it)");
     }
-    if (outTracks.count) [@"done\n" writeToURL:[folder URLByAppendingPathComponent:@".done"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // Only mark the session complete when every requested export succeeded.
+    // If finalization fails, leave .done absent so launch-time recovery can retry.
+    if (outTracks.count && !errs.count) {
+        NSError *doneError = nil;
+        BOOL markedDone = [@"done\n" writeToURL:[folder URLByAppendingPathComponent:@".done"]
+                                      atomically:YES
+                                        encoding:NSUTF8StringEncoding
+                                           error:&doneError];
+        if (!markedDone) {
+            [errs addObject:[NSString stringWithFormat:@"Could not write completion marker: %@",
+                             doneError.localizedDescription ?: @"unknown error"]];
+            EVE("Split", @"could not write .done marker: %@", doneError);
+        }
+    }
 }
 
 void EVFinalizeSession(NSURL *wav, uint32_t rate, NSArray<EVMarker *> *markersIn, uint64_t total, EVFinalizeDone done) {
@@ -789,11 +1127,18 @@ void EVResumePendingSessions(void) {
                 mk.info = [EVTrackInfo fromDictionary:m[@"info"] ?: @{}];
                 [ms addObject:mk];
             }
+            NSURL *attemptsURL = [dir URLByAppendingPathComponent:@".resume_attempts"];
+            NSInteger attempts = [[NSString stringWithContentsOfURL:attemptsURL encoding:NSUTF8StringEncoding error:nil] integerValue];
+            if (attempts >= 3) {
+                EVW("Resume", @"%@: giving up after %ld attempts (audio is kept; export it manually)", dir.lastPathComponent, (long)attempts);
+                continue;
+            }
+            [[NSString stringWithFormat:@"%ld\n", (long)attempts + 1] writeToURL:attemptsURL atomically:YES encoding:NSUTF8StringEncoding error:nil];
             EVI("Resume", @"finishing interrupted session %@ (%lu marker(s))", dir.lastPathComponent, (unsigned long)ms.count);
             NSMutableArray<NSURL *> *files = [NSMutableArray array];
             NSMutableArray<NSDictionary *> *tracks = [NSMutableArray array];
             NSMutableArray<NSString *> *errs = [NSMutableArray array];
-            evRunFinalize(wav, [root[@"rate"] unsignedIntValue], ms, 0, files, tracks, errs);
+            evRunFinalize(wav, 0, ms, 0, files, tracks, errs);  // 0 = take the rate from the WAV header (refreshed every 2 s)
             EVI("Resume", @"%@: %lu track(s), errors: %@", dir.lastPathComponent, (unsigned long)tracks.count, errs.count ? errs : @"none");
         }
     });
